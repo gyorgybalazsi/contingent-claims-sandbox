@@ -1,0 +1,183 @@
+module OrderOfOperations where 
+
+import DA.Assert
+import Daml.Script
+import DA.Action ((>=>)) 
+import DA.Foldable (foldl1)
+import DA.List (sortOn)
+import DA.Map (Map)
+import qualified DA.Map as Map
+import Prelude hiding (lookup)
+
+import Daml.Control.Arrow 
+
+k1 = Kleisli \x -> [x+1]
+k2 = Kleisli \x -> [x*10]
+
+testKleisli : Script ()
+testKleisli = do
+    runKleisli k1 1 === [2]
+    runKleisli k2 1 === [10]
+
+    ((\x -> [x+1]) >=> (\x -> [x*10])) 1 === [20]
+
+    (runKleisli k1 >=> runKleisli k2) 1 === [20]
+
+    runKleisli (k1 >>> k2) 1 === [20]
+
+    runKleisli (returnA >>> k2) 1 === [10]
+
+    runKleisli (foldl (>>>) returnA [k1, k2]) 1 === [20]
+
+    runKleisli (foldl1 (>>>) [k1, k2]) 1 === [20] 
+
+template Asset
+    with 
+        issuer : Party 
+        amount : Int 
+    where 
+        signatory issuer 
+        choice Issuer_AddsOne : ContractId Asset 
+            controller issuer 
+            do 
+                create this with amount = amount + 1
+        choice Issuer_MultipliesWithTen : ContractId Asset 
+            controller issuer 
+            do 
+                create this with amount = amount * 10 
+        choice Issuer_Squares : ContractId Asset 
+            controller issuer 
+            do 
+                create this with amount = amount * amount 
+
+template SimpleLifeCycler 
+    with 
+        admin : Party 
+    where 
+        signatory admin 
+        choice Admin_ProcessUpdates : ContractId Asset 
+            with 
+                assetCid : ContractId Asset
+            controller admin 
+            do 
+                let 
+                    k1 = Kleisli (`exercise` Issuer_AddsOne)
+                    k2 = Kleisli (`exercise` Issuer_MultipliesWithTen)
+                    k3 = Kleisli (`exercise` Issuer_Squares)
+                runKleisli (foldl1 (>>>) [k1, k2, k3]) assetCid 
+
+testSimpleLifeCycle : Script () 
+testSimpleLifeCycle = do 
+    alice <- allocateParty "Alice" 
+    assetCid <- submit alice $ createCmd Asset with issuer = alice, amount = 1 
+    lifeCyclerCid <- submit alice $ createCmd SimpleLifeCycler with admin = alice 
+    updatedAssetCid <- submit alice $ exerciseCmd lifeCyclerCid Admin_ProcessUpdates with .. 
+    Some assetPayload <- queryContractId alice updatedAssetCid 
+    debug assetPayload.amount
+    assetPayload.amount === 400
+
+template AddOneTx
+    with 
+        admin : Party 
+    where 
+        signatory admin 
+        choice RunAddOne : ContractId Asset 
+            with 
+                targetCid : ContractId Asset 
+            controller admin
+            do 
+                exercise targetCid Issuer_AddsOne 
+
+template MultipliyWithTenTx 
+    with 
+        admin : Party 
+    where 
+        signatory admin 
+        choice RunMultiplyWithTen : ContractId Asset 
+            with 
+                targetCid : ContractId Asset 
+            controller admin 
+            do 
+                exercise targetCid Issuer_MultipliesWithTen 
+
+template SquareTx
+    with 
+        admin : Party 
+    where 
+        signatory admin 
+        choice RunSquare : ContractId Asset 
+            with 
+                targetCid : ContractId Asset 
+            controller admin 
+            do 
+                exercise targetCid Issuer_Squares 
+
+data TxType = AddOne | MultipliyWithTen | Square deriving (Eq, Show, Ord)
+
+data TxCid  = AddOneTxCid with addOneTxCid : ContractId AddOneTx 
+            | MultipliyWithTenTxCid with multipliyWithTenTxCid : ContractId MultipliyWithTenTx 
+            | SquareTxCid with squareTxCid : ContractId SquareTx
+                deriving (Eq, Show)
+
+data Instruction = Instruction with 
+    txType : TxType 
+    txCid : TxCid  
+        deriving (Eq, Show) 
+
+buildKleisli : Instruction -> Kleisli Update (ContractId Asset) (ContractId Asset)
+buildKleisli Instruction{..} = case txType of 
+    AddOne -> Kleisli  \targetCid -> exercise (addOneTxCid txCid) RunAddOne with targetCid = targetCid
+    MultipliyWithTen -> Kleisli  \targetCid -> exercise (multipliyWithTenTxCid txCid) RunMultiplyWithTen with targetCid = targetCid 
+    Square -> Kleisli  \targetCid -> exercise (squareTxCid txCid) RunSquare with targetCid = targetCid 
+
+type OrderOfOps = Map TxType Int
+
+template LifeCycle 
+    with  
+        admin : Party 
+        orderOfOps : OrderOfOps
+    where 
+        signatory admin 
+        choice RunLifeCycle : ContractId Asset 
+            with 
+                assetCid : ContractId Asset 
+                instructions : [Instruction]
+            controller admin 
+            do 
+            let sortedInstructions = sortOn ((`Map.lookup` orderOfOps) . txType) instructions
+            runKleisli (foldl1 (>>>) . map buildKleisli $ sortedInstructions) assetCid 
+
+testLifeCycle : Script () 
+testLifeCycle = do 
+    alice <- allocateParty "Alice" 
+    assetCid <- submit alice $ createCmd Asset with issuer = alice, amount = 1 
+    addOneCid <- submit alice $ createCmd AddOneTx with admin = alice
+    multiplyWithTenCid <- submit alice $ createCmd MultipliyWithTenTx with admin = alice
+    squareCid <- submit alice $ createCmd SquareTx with admin = alice
+
+    let orderOfOps = Map.fromList [(AddOne, 100), (MultipliyWithTen, 200), (Square, 300)]
+
+    lifeCycleCid <- submit alice $ createCmd LifeCycle with admin = alice, ..
+
+    let instructions =  [ (Instruction AddOne (AddOneTxCid addOneCid))
+                        , (Instruction MultipliyWithTen (MultipliyWithTenTxCid multiplyWithTenCid))
+                        , (Instruction Square (SquareTxCid squareCid))
+                        ]
+
+    resultCid <- submit alice $ exerciseCmd lifeCycleCid RunLifeCycle with ..
+    Some resultPayload <- queryContractId alice resultCid 
+    debug resultPayload.amount 
+    resultPayload.amount === 400
+
+testUpdateOrderOfOps : Script ()
+testUpdateOrderOfOps = do 
+    let orderOfOpsDefault = Map.fromList [(AddOne, 100), (MultipliyWithTen, 200)]
+    let orderOfOpsUpdate = Map.fromList [(AddOne, 500), (Square, 300)]
+    let orderOfOpsUpdated = Map.union orderOfOpsUpdate orderOfOpsDefault 
+    -- The first argument of Map.union overrides and/or extends the second argument
+    debug orderOfOpsUpdated
+    orderOfOpsUpdated === Map.fromList [(AddOne,500),(MultipliyWithTen,200),(Square,300)]
+
+
+
+    
